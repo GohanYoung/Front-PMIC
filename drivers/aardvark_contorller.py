@@ -109,14 +109,3 @@ class AardvarkI2C:
     def read_byte(self, dev_addr, reg):
         data = self.read(dev_addr, reg, length=1)
         return data[0]
-
-    # ==================================================
-    # Device Detect
-    # ==================================================
-
-    def ping(self, dev_addr):
-        try:
-            self.write(dev_addr, [])
-            return True
-        except Exception:
-            return False

@@ -1,136 +1,159 @@
 import sys
-import time
-import threading
 
+from drivers.aardvark_contorller import AardvarkI2C
 from drivers.power_controller import PowerController
-from sequence.power_on_sequence import PowerOnSequence
+from drivers.tca9548a import TCA9548A
 
 
-PSU_PORT = "COM4"
-PSU_BAUD = 19200
-PSU_TIMEOUT = 1
+PSU_PORT = "COM5"
+PSU_BAUDRATE = 19200
+
+STEP = 2.0
+INTERVAL = 1.0
+STABLE_ON = 0.3
+STABLE_OFF = 0.2
 
 
-def check(condition, pass_msg, fail_msg):
-    if condition:
-        print(f"  [PASS] {pass_msg}")
+def check_voltage(power, channel, expected, tol):
+    actual = power.measure_voltage(channel)
+    if abs(actual - expected) <= tol:
+        print(f"  [PASS] CH{channel}={actual:.3f}V (target={expected}V)")
         return True
-    print(f"  [FAIL] {fail_msg}")
+    print(f"  [FAIL] CH{channel}={actual:.3f}V (target={expected}V)")
     return False
+
+
+def emergency_stop(power):
+    print("[TEST] EMERGENCY STOP")
+    for ch in [PowerController.CH_VIN, PowerController.CH_VCAP, PowerController.CH_VEXT]:
+        try:
+            power.select_channel(ch)
+            power.write("VOLT 0")
+            power.write("OUTP OFF")
+        except Exception:
+            pass
+    power.current_channel = None
 
 
 def main():
     print("=" * 50)
-    print("  Power-On Sequence Test (parallel)")
-    print(f"  Port: {PSU_PORT}  Baud: {PSU_BAUD}")
+    print("[TEST] HTOL Power Sequence Test (main style, no register write)")
     print("=" * 50)
 
-    psu = PowerController(port=PSU_PORT, baudrate=PSU_BAUD, timeout=PSU_TIMEOUT)
-    seq = PowerOnSequence(psu)
-    graceful = True
+    i2c = AardvarkI2C(port=0, bitrate=400)
+    power = PowerController(port=PSU_PORT, baudrate=PSU_BAUDRATE)
+    mux = None
+    need_emergency = False
 
     try:
-        psu.connect()
-        print(f"[PSU] {psu.identify()}")
-        psu.configure_protection()
+        print("[TEST] Opening Aardvark I2C (port=0, 400kbps)...")
+        i2c.open()
+        print("[TEST] I2C ready")
 
-        t0 = time.time()
-        errors = {}
+        print("[TEST] Opening TCA9548A MUX (addr=0x70) ...")
+        mux = TCA9548A(i2c)
+        mux.disable_all()
+        print("[TEST] MUX ready")
 
-        def _ramp_worker(target_fn, name):
-            try:
-                target_fn()
-            except Exception as e:
-                errors[name] = e
+        print(f"[TEST] Connecting PSU on {PSU_PORT} @ {PSU_BAUDRATE}bps...")
+        power.connect()
+        print(f"[TEST] PSU ready: {power.identify()}")
+        power.configure_protection()
 
-        threads = [
-            threading.Thread(target=_ramp_worker,
-                             args=(seq.enable_5v, "CH5V")),
-            threading.Thread(target=_ramp_worker,
-                             args=(lambda: seq.vin_to_17v(), "VIN")),
-            threading.Thread(target=_ramp_worker,
-                             args=(seq.vcap_to_35v, "VCAP")),
-        ]
+        # ---- Power-On Phase 1: VEXT 5V + VIN 8V (parallel) ----
+        print("\n>>> ON Phase 1: Vext=5V and VIN=8V (parallel)")
+        power.parallel_ramp([
+            ("VEXT", PowerController.CH_VEXT, 5.0, True),
+            ("VIN", PowerController.CH_VIN, 8.0, True),
+        ], step=STEP, stable_time=STABLE_ON, step_interval=INTERVAL)
 
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
+        # ---- Power-On Phase 2: VIN 12V + VCAP 35V (parallel) ----
+        print("\n>>> ON Phase 2: VIN=12V and VCAP=35V (parallel)")
+        power.parallel_ramp([
+            ("VIN", PowerController.CH_VIN, 12.0, False),
+            ("VCAP", PowerController.CH_VCAP, 35.0, True),
+        ], step=STEP, stable_time=STABLE_ON, step_interval=INTERVAL)
 
-        elapsed = time.time() - t0
+        # ---- Power-On Phase 3: VIN 17V ----
+        print("\n>>> ON Phase 3: VIN -> 17V")
+        power.ramp_voltage(
+            PowerController.CH_VIN,
+            17.0,
+            step=STEP,
+            stable_time=STABLE_ON,
+            step_interval=INTERVAL,
+        )
 
-        if errors:
-            graceful = False
-            print(f"\n  Ramp errors: {errors}")
-            return 1
+        print("\n>>> Verify ON targets")
+        on_ok = []
+        on_ok.append(check_voltage(power, PowerController.CH_VEXT, 5.0, 0.1))
+        on_ok.append(check_voltage(power, PowerController.CH_VIN, 17.0, 0.1))
+        on_ok.append(check_voltage(power, PowerController.CH_VCAP, 35.0, 0.15))
+        if not all(on_ok):
+            raise RuntimeError("Power-on verification failed")
 
-        print(f"\n  All channels ramped up in {elapsed:.1f}s")
+        # ---- Power-Off Phase 1: VIN 17V -> 12V ----
+        print("\n>>> OFF Phase 1: VIN 17V -> 12V")
+        power.ramp_voltage(
+            PowerController.CH_VIN,
+            12.0,
+            step=STEP,
+            stable_time=STABLE_OFF,
+            step_interval=INTERVAL,
+            ensure_output=False,
+        )
 
-        results = []
-        results.append(check(
-            abs(psu.measure_voltage(psu.CH_5V) - 5.0) <= 0.1,
-            f"CH5V = {psu.measure_voltage(psu.CH_5V):.2f}V",
-            "CH5V wrong"))
-        results.append(check(
-            abs(psu.measure_voltage(psu.CH_VIN) - 17.0) <= 0.1,
-            f"VIN = {psu.measure_voltage(psu.CH_VIN):.2f}V",
-            "VIN wrong"))
-        results.append(check(
-            abs(psu.measure_voltage(psu.CH_VCAP) - 35.0) <= 0.15,
-            f"VCAP = {psu.measure_voltage(psu.CH_VCAP):.2f}V",
-            "VCAP wrong"))
+        # ---- Power-Off Phase 2: VIN 12V -> 8V + VCAP 35V -> 0V (parallel) ----
+        print("\n>>> OFF Phase 2: VIN=8V and VCAP=0V (parallel)")
+        power.parallel_ramp([
+            ("VIN", PowerController.CH_VIN, 8.0, False),
+            ("VCAP", PowerController.CH_VCAP, 0.0, False),
+        ], step=STEP, stable_time=STABLE_OFF, step_interval=INTERVAL)
 
-        ok = sum(results)
-        total = len(results)
-        print(f"\n  Result: {ok}/{total} PASS")
+        # ---- Power-Off Phase 3: VIN 8V -> 0V + VEXT 5V -> 0V (parallel) ----
+        print("\n>>> OFF Phase 3: VIN=0V and VEXT=0V (parallel)")
+        power.parallel_ramp([
+            ("VIN", PowerController.CH_VIN, 0.0, False),
+            ("VEXT", PowerController.CH_VEXT, 0.0, False),
+        ], step=STEP, stable_time=STABLE_OFF, step_interval=INTERVAL)
+
+        print("\n>>> Verify OFF targets")
+        off_ok = []
+        off_ok.append(check_voltage(power, PowerController.CH_VEXT, 0.0, 0.1))
+        off_ok.append(check_voltage(power, PowerController.CH_VIN, 0.0, 0.1))
+        off_ok.append(check_voltage(power, PowerController.CH_VCAP, 0.0, 0.15))
+        if not all(off_ok):
+            raise RuntimeError("Power-off verification failed")
+
+        power.output_off(PowerController.CH_VIN)
+        power.output_off(PowerController.CH_VCAP)
+        power.output_off(PowerController.CH_VEXT)
+
+        print("\n" + "=" * 50)
+        print("[TEST] PASS: Power ON/OFF sequence completed")
+        print("=" * 50)
+        return 0
 
     except KeyboardInterrupt:
-        print("\n[!] Ctrl+C")
-        graceful = False
+        print("\n[TEST] Interrupted")
+        need_emergency = True
+        return 1
     except Exception as e:
-        print(f"  [FAIL] {e}")
-        graceful = False
-
+        print(f"[TEST] FAIL: {e}")
+        need_emergency = True
+        return 1
     finally:
-        if graceful:
+        if need_emergency and power.ser is not None:
+            emergency_stop(power)
+
+        if mux is not None:
             try:
-                print("\n[TEST] Parallel shutdown")
-                down_errors = {}
+                mux.disable_all()
+            except Exception:
+                pass
 
-                def _down_worker(channel, name):
-                    try:
-                        seq.shutdown_channel(channel)
-                    except Exception as e:
-                        down_errors[name] = e
-
-                t_down = [
-                    threading.Thread(target=_down_worker,
-                                     args=(psu.CH_VIN, "VIN")),
-                    threading.Thread(target=_down_worker,
-                                     args=(psu.CH_VCAP, "VCAP")),
-                    threading.Thread(target=_down_worker,
-                                     args=(psu.CH_5V, "CH5V")),
-                ]
-                for t in t_down:
-                    t.start()
-                for t in t_down:
-                    t.join()
-
-                if down_errors:
-                    print(f"  Shutdown errors: {down_errors}")
-                    seq.emergency_stop()
-                else:
-                    seq.global_output_off()
-                    print("  All channels 0V & OUTP OFF")
-            except Exception as e:
-                print(f"  Graceful shutdown failed: {e}")
-                seq.emergency_stop()
-        else:
-            seq.emergency_stop()
-        psu.disconnect()
-        print("\n[TEST] Done")
-
-    return 0
+        i2c.close()
+        power.disconnect()
 
 
 if __name__ == "__main__":

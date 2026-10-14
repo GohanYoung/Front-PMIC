@@ -7,11 +7,11 @@ class PowerController:
 
     CH_VIN = 1
     CH_VCAP = 2
-    CH_5V = 3
+    CH_VEXT = 3
 
     VIN_MAX = 30.0
     VCAP_MAX = 40.0
-    CH5V_MAX = 10.0
+    VEXT_MAX = 10.0
 
     OVERSHOOT_MARGIN = 2.0
     OVERSHOOT_DISABLED = 999
@@ -85,7 +85,7 @@ class PowerController:
             self.write(cmd)
             return self.ser.readline().decode().strip()
 
-    def check_error(self):
+    def _check_error(self):
         resp = self.query("SYST:ERR?")
         if not resp.startswith('0'):
             raise RuntimeError(f"PSU SCPI Error: {resp}")
@@ -134,22 +134,17 @@ class PowerController:
     # Output
     # ==================================================
 
-    def output_on(self, channel):
+    def _output_on(self, channel):
         with self._lock:
             self.select_channel(channel)
             self.write("OUTP ON")
-            self.check_error()
+            self._check_error()
 
     def output_off(self, channel):
         with self._lock:
             self.select_channel(channel)
             self.write("OUTP OFF")
-            self.check_error()
-
-    def is_output_on(self, channel):
-        with self._lock:
-            self.select_channel(channel)
-            return bool(int(self.query("OUTP?")))
+            self._check_error()
 
     # ==================================================
     # Voltage
@@ -160,11 +155,11 @@ class PowerController:
             return self.VIN_MAX
         if channel == self.CH_VCAP:
             return self.VCAP_MAX
-        if channel == self.CH_5V:
-            return self.CH5V_MAX
+        if channel == self.CH_VEXT:
+            return self.VEXT_MAX
         raise ValueError(f"Unknown channel {channel}")
 
-    def set_voltage(self, channel, voltage):
+    def _set_voltage(self, channel, voltage):
         vmax = self._channel_voltage_limit(channel)
         if voltage < 0 or voltage > vmax:
             raise ValueError(
@@ -174,7 +169,7 @@ class PowerController:
         with self._lock:
             self.select_channel(channel)
             self.write(f"VOLT {voltage}")
-            self.check_error()
+            self._check_error()
             actual = float(self.query("VOLT?"))
         if abs(actual - voltage) > 0.05:
             raise RuntimeError(
@@ -182,7 +177,7 @@ class PowerController:
                 f"Target={voltage}V PSU={actual}V"
             )
 
-    def get_voltage_setpoint(self, channel):
+    def _get_voltage_setpoint(self, channel):
         with self._lock:
             self.select_channel(channel)
             return float(self.query("VOLT?"))
@@ -191,18 +186,13 @@ class PowerController:
     # Current
     # ==================================================
 
-    def set_current(self, channel, current):
+    def _set_current(self, channel, current):
         if current <= 0 or current > 5.0:
             raise ValueError(f"Current {current}A out of range (0 ~ 5A)")
         with self._lock:
             self.select_channel(channel)
             self.write(f"CURR {current}")
-            self.check_error()
-
-    def get_current_setpoint(self, channel):
-        with self._lock:
-            self.select_channel(channel)
-            return float(self.query("CURR?"))
+            self._check_error()
 
     # ==================================================
     # Measurement
@@ -213,16 +203,11 @@ class PowerController:
             self.select_channel(channel)
             return float(self.query("MEAS:VOLT?"))
 
-    def measure_current(self, channel):
-        with self._lock:
-            self.select_channel(channel)
-            return float(self.query("MEAS:CURR?"))
-
     # ==================================================
     # Wait / Ramp
     # ==================================================
 
-    def wait_voltage(self, channel, target, tolerance=0.05, timeout=10,
+    def _wait_voltage(self, channel, target, tolerance=0.05, timeout=10,
                      overshoot_margin=None, stable_time=1):
         if overshoot_margin is None:
             overshoot_margin = self.OVERSHOOT_MARGIN
@@ -257,17 +242,17 @@ class PowerController:
         if step <= 0:
             raise ValueError("step must be > 0")
         if ensure_output:
-            self.output_on(channel)
+            self._output_on(channel)
         if reset_before:
-            self.set_voltage(channel, 0.0)
-            self.wait_voltage(channel, 0.0, tolerance=0.1, timeout=timeout,
+            self._set_voltage(channel, 0.0)
+            self._wait_voltage(channel, 0.0, tolerance=0.1, timeout=timeout,
                               stable_time=stable_time,
                               overshoot_margin=self.OVERSHOOT_DISABLED)
             current = 0.0
         else:
-            current = self.get_voltage_setpoint(channel)
+            current = self._get_voltage_setpoint(channel)
         if abs(target - current) <= tolerance:
-            return self.wait_voltage(channel, target, tolerance, timeout,
+            return self._wait_voltage(channel, target, tolerance, timeout,
                                      stable_time=stable_time)
         direction = 1 if target > current else -1
         down = direction < 0
@@ -278,8 +263,8 @@ class PowerController:
                (direction < 0 and v <= target):
                 v = target
             t_step = time.time()
-            self.set_voltage(channel, round(v, 3))
-            self.wait_voltage(channel, v, tolerance, timeout,
+            self._set_voltage(channel, round(v, 3))
+            self._wait_voltage(channel, v, tolerance, timeout,
                               stable_time=stable_time,
                               overshoot_margin=self.OVERSHOOT_DISABLED if down else None)
             if v == target:
@@ -289,6 +274,35 @@ class PowerController:
                 time.sleep(remain)
         return self.measure_voltage(channel)
 
+    def parallel_ramp(self, tasks, step=2.0, stable_time=0.3, step_interval=1.0):
+        """tasks: list of (label, channel, target, reset_before)"""
+        errors = {}
+        threads = []
+
+        def _worker(label, channel, target, reset_before):
+            try:
+                print(f"  [PSU] {label} (CH{channel}) -> {target}V ...")
+                self.ramp_voltage(channel, target, reset_before=reset_before,
+                                  step=step, stable_time=stable_time,
+                                  step_interval=step_interval)
+                print(f"  [PSU] {label} = {target}V OK")
+            except Exception as e:
+                errors[label] = e
+                print(f"  [PSU] {label} FAILED: {e}")
+
+        for label, ch, target, reset_before in tasks:
+            t = threading.Thread(target=_worker,
+                                 args=(label, ch, target, reset_before))
+            threads.append(t)
+
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        if errors:
+            raise RuntimeError(f"Parallel ramp failed: {errors}")
+
     # ==================================================
     # Protection
     # ==================================================
@@ -296,20 +310,20 @@ class PowerController:
     def configure_protection(self):
         self._clear_error_queue()
 
-        self.set_current(self.CH_VIN, 3.0)
-        self.set_current(self.CH_VCAP, 3.0)
-        self.set_current(self.CH_5V, 1.0)
+        self._set_current(self.CH_VIN, 3.0)
+        self._set_current(self.CH_VCAP, 3.0)
+        self._set_current(self.CH_VEXT, 1.0)
 
         ovp_vin = self.VIN_MAX + 1.0
         ovp_vcap = self.VCAP_MAX + 1.0
-        ovp_5v = self.CH5V_MAX + 1.0
+        ovp_vext = self.VEXT_MAX + 1.0
 
         ovp_ok = self.hw_ovp_supported
         if ovp_ok:
             try:
                 for ch, val in [(self.CH_VIN, ovp_vin),
                                 (self.CH_VCAP, ovp_vcap),
-                                (self.CH_5V, ovp_5v)]:
+                                (self.CH_VEXT, ovp_vext)]:
                     self.select_channel(ch)
                     self.write(f"OVP:VAL {val}")
                     self._clear_error_queue()
@@ -320,12 +334,12 @@ class PowerController:
         if ovp_ok:
             print(
                 f"[PSU] Protection: HW OVP enabled "
-                f"VIN={ovp_vin}V VCAP={ovp_vcap}V 5V={ovp_5v}V | "
-                f"OCP VIN=3A VCAP=3A 5V=1A"
+                f"VIN={ovp_vin}V VCAP={ovp_vcap}V VEXT={ovp_vext}V | "
+                f"OCP VIN=3A VCAP=3A VEXT=1A"
             )
         else:
             print(
                 f"[PSU] Protection: SW limits only "
-                f"VIN≤{self.VIN_MAX}V VCAP≤{self.VCAP_MAX}V 5V≤{self.CH5V_MAX}V | "
-                f"OCP VIN=3A VCAP=3A 5V=1A"
+                f"VIN≤{self.VIN_MAX}V VCAP≤{self.VCAP_MAX}V VEXT≤{self.VEXT_MAX}V | "
+                f"OCP VIN=3A VCAP=3A VEXT=1A"
             )
