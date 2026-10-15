@@ -1,4 +1,5 @@
 import threading
+import time
 
 from drivers.rt5131 import RT5131
 
@@ -34,6 +35,21 @@ class TCA9548A:
                 return
             self.i2c.write(self.addr, [1 << channel])
             self._current = channel
+
+    def select_channel_with_retry(self, channel, retry=3, retry_delay_ms=10):
+        if retry <= 0:
+            raise ValueError("retry must be > 0")
+
+        last_exc = None
+        for attempt in range(1, retry + 1):
+            try:
+                self.select_channel(channel)
+                return
+            except Exception as exc:
+                last_exc = exc
+                if attempt < retry:
+                    time.sleep(retry_delay_ms / 1000.0)
+        raise last_exc
 
     def disable_all(self):
         with self._lock:
