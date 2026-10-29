@@ -59,6 +59,41 @@ class TCA9548A:
     def route(self, channel):
         return _RouteContext(self, channel)
 
+    def read_byte_with_channel_recovery(
+        self,
+        channel,
+        dev_addr,
+        reg,
+        read_retry=2,
+        retry_delay_ms=10,
+        recover_reopen_delay_ms=20,
+    ):
+        if read_retry <= 0:
+            raise ValueError("read_retry must be > 0")
+
+        last_exc = None
+        for attempt in range(1, read_retry + 1):
+            try:
+                self.select_channel_with_retry(channel, retry=3, retry_delay_ms=retry_delay_ms)
+                value = self.i2c.read_byte(dev_addr, reg)
+                return value
+            except Exception as exc:
+                last_exc = exc
+                try:
+                    self.disable_all()
+                except Exception:
+                    pass
+
+                try:
+                    self.i2c.recover_bus(reopen_delay_ms=recover_reopen_delay_ms)
+                except Exception:
+                    pass
+
+                if attempt < read_retry and retry_delay_ms > 0:
+                    time.sleep(retry_delay_ms / 1000.0)
+
+        raise last_exc
+
     def write_table_to_all(self, table, label="", channels=8):
         print(f"\n  [{label}] Writing {len(table)} regs to {channels} MUX channels ...")
         summary = []

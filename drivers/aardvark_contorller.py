@@ -85,6 +85,21 @@ class AardvarkI2C:
             self.handle = None
             print("[Aardvark] Closed")
 
+    def recover_bus(self, reopen_delay_ms=20):
+        if reopen_delay_ms < 0:
+            raise ValueError("reopen_delay_ms must be >= 0")
+
+        was_open = self.handle is not None
+        if was_open:
+            aa_close(self.handle)
+            self.handle = None
+            self._log("[Aardvark] Recover: adapter closed")
+            if reopen_delay_ms > 0:
+                time.sleep(reopen_delay_ms / 1000.0)
+
+        self.open()
+        self._log("[Aardvark] Recover: adapter reopened")
+
     # ==================================================
     # Write
     # ==================================================
