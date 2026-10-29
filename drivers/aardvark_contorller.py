@@ -7,6 +7,7 @@ try:
         aa_close,
         aa_configure,
         aa_i2c_bitrate,
+        aa_i2c_free_bus,
         aa_i2c_pullup,
         aa_target_power,
         aa_i2c_write,
@@ -89,13 +90,19 @@ class AardvarkI2C:
         if reopen_delay_ms < 0:
             raise ValueError("reopen_delay_ms must be >= 0")
 
-        was_open = self.handle is not None
-        if was_open:
-            aa_close(self.handle)
-            self.handle = None
-            self._log("[Aardvark] Recover: adapter closed")
-            if reopen_delay_ms > 0:
-                time.sleep(reopen_delay_ms / 1000.0)
+        self._check_open()
+        status = aa_i2c_free_bus(self.handle)
+        if status < 0:
+            raise RuntimeError(
+                f"I2C free-bus failed: {aa_status_string(status)}"
+            )
+        self._log("[Aardvark] Recover: aa_i2c_free_bus done")
+
+        aa_close(self.handle)
+        self.handle = None
+        self._log("[Aardvark] Recover: adapter closed")
+        if reopen_delay_ms > 0:
+            time.sleep(reopen_delay_ms / 1000.0)
 
         self.open()
         self._log("[Aardvark] Recover: adapter reopened")

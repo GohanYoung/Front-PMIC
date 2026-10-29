@@ -72,6 +72,8 @@ class TCA9548A:
             raise ValueError("read_retry must be > 0")
 
         last_exc = None
+        last_disable_err = None
+        last_recover_err = None
         for attempt in range(1, read_retry + 1):
             try:
                 self.select_channel_with_retry(channel, retry=3, retry_delay_ms=retry_delay_ms)
@@ -79,20 +81,31 @@ class TCA9548A:
                 return value
             except Exception as exc:
                 last_exc = exc
+                last_disable_err = None
+                last_recover_err = None
                 try:
                     self.disable_all()
-                except Exception:
-                    pass
+                except Exception as disable_exc:
+                    last_disable_err = disable_exc
+                finally:
+                    self._current = None
 
                 try:
                     self.i2c.recover_bus(reopen_delay_ms=recover_reopen_delay_ms)
-                except Exception:
-                    pass
+                except Exception as recover_exc:
+                    last_recover_err = recover_exc
 
                 if attempt < read_retry and retry_delay_ms > 0:
                     time.sleep(retry_delay_ms / 1000.0)
-
-        raise last_exc
+        msg = (
+            f"read with recovery failed channel={channel} addr=0x{dev_addr:02X} "
+            f"reg=0x{reg:02X}: {last_exc}"
+        )
+        if last_disable_err is not None:
+            msg += f" | disable_all_err={last_disable_err}"
+        if last_recover_err is not None:
+            msg += f" | recover_bus_err={last_recover_err}"
+        raise RuntimeError(msg)
 
     def write_table_to_all(self, table, label="", channels=8):
         print(f"\n  [{label}] Writing {len(table)} regs to {channels} MUX channels ...")

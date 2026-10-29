@@ -43,7 +43,7 @@ def main():
         bitrate=args.bitrate,
         debug=False,
         enable_pullup=True,
-        enable_target_power=False,
+        enable_target_power=True,
     )
 
     reg = args.reg & 0xFF
